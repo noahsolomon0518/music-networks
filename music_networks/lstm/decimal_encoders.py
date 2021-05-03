@@ -4,8 +4,14 @@ from os import path
 import math
 import warnings
 import music21
-from music21 import midi
+from music21 import midi, converter
 from sys import getsizeof
+from timeit import timeit
+import time
+import pickle
+from multiprocessing import Process, Queue, Array
+import multiprocessing as mp
+
 
 HALF_STEPS_ABOVE_C = {
         "C":0,
@@ -30,114 +36,151 @@ HALF_STEPS_ABOVE_C = {
         "B":11
     }
 
-# Takes list of paths (or just one), and parses into mido object
-def parseMidis(paths, convertToC, mode, removeDrums):
-    parsedMidis = []
-
-    if(type(paths) != list):
-        paths = [paths]
 
 
+class MidiParser:
+    """
+    This object is used to parse midis to music21 streams and performs functions such as 
+    converting all pieces to C, only extracting a certain mode ect. This process takes a long time
+    so there is a function called serialize which pickles the streams so the decimal encoder
+    can quickly extract the parsed midis whenever it needs to. 
+    """
+
+    def __init__(self, folder, convertToC, mode, removeDrums, debug = False):
+
+        self.convertToC = convertToC
+        self.mode = mode
+        self.removeDrums = removeDrums
+        self.debug = debug
+        self.midiPaths = []
+        self.queueMidis(folder)
+        self._dbg(str(len(self.midiPaths))+ "midis queued up to be parsed.")
+
+
+        
+
+    
+
+    def parse(self, saveTo, nWorkers = 8):
+        nMidis = len(self.midiPaths)
+        parsingSplit = self.partitionSplit(nMidis, nWorkers)
+        processes = []
+        for split in parsingSplit:
+            p = mp.Process(target=self.parsePartition, args=(self.midiPaths, split, saveTo))
+            p.start()
+            processes.append(p)
+        for process in processes:
+            process.join()
+        
+
+
+    def partitionSplit(self, nMidis, nWorkers):
+        split = [[] for i in range(nWorkers)]
+        for ind in range(nMidis):
+            split[ind%nWorkers].append(ind)
+        return split
 
 
 
-    for _path in paths:
-        mf = midi.MidiFile()
-        mf.open(_path)
-        mf.read()
-        mf.close()
-        valid = True
-        if(removeDrums):
-            for i in range(len(mf.tracks)):
-                mf.tracks[i].events = [ev for ev in mf.tracks[i].events if ev.channel != 10]  
-        midiStream = midi.translate.midiFileToStream(mf)
-        print(midiStream)
-        key = midiStream.analyze('key')
-        midiStream.insert(0,key)
+    def parsePartition(self, _paths, inds, folder):
+        for ind in inds:
+            _path = _paths[ind]
+            valid = True
+            midiStream = converter.parse(_path)
+            key = midiStream.analyze('key')
+            midiStream.insert(0,key)
+            if(self.mode != key.mode and self.mode != "both"):
+                continue
+        
+            if(self.convertToC):
+                self._convertToC(midiStream)
 
-        if(mode != key.mode and mode != "both"):
-            valid = False
-
-
-        if(valid and not convertToC):
-            parsedMidis.append(midiStream)
-
-        if(valid and convertToC):
-            key.transpose(int(12-HALF_STEPS_ABOVE_C[key.tonic.name]), inPlace = True)
-            for n in midiStream.recurse().notes:
-                n.transpose(int(12-HALF_STEPS_ABOVE_C[key.tonic.name]), inPlace = True)
-            parsedMidis.append(midiStream)
-
-    return parsedMidis
+            
+            self.serialize(midiStream, folder)
 
 
-# Recursively creates list of midi files in directory
-def findMidis(folder, r=True):
-    paths = []
-    if(".mid" in folder):
-        paths.append(folder)
-        return paths
+    def _convertToC(self, stream):
+        key = stream.keySignature
+        key.transpose(int(12-HALF_STEPS_ABOVE_C[key.tonic.name]), inPlace = True)
+        for n in stream.recurse().notes:
+            n.transpose(int(12-HALF_STEPS_ABOVE_C[key.tonic.name]), inPlace = True)
 
-    for (dirpath, _, filenames) in walk(folder):
-        for file in filenames:
-            if ".mid" in file:
-                paths.append(path.join(dirpath, file))
-        if not r:
-            return paths
-    return paths
+
+
+
+    def serialize(self, parsedMidis, folder):
+        if type(parsedMidis) != list:
+            parsedMidis = [parsedMidis] 
+
+        for parsedMidi in parsedMidis:
+            converter.freeze(parsedMidi, fp = folder+"/"+str(parsedMidi.id)+".stream")
+
+
+
+    def _dbg(self, msg):
+        if(self.debug):
+            print("[DEBUG "+ str(time.time()) +"]:"+msg)
+
+
+    def queueMidis(self, folder, r=True):
+        """
+        Queues up midis to be parsed
+
+        Parameters
+        ----------
+        folder: str
+            The folder at which the midis are located
+        r: bool
+            Whether the midis should be recursively extracted from the folders
+        
+        Returns list of paths
+        """
+        paths = []
+        if(".mid" in folder):
+            paths.append(folder)
+            self.midiPaths.extend(paths)
+            return 
+
+        for (dirpath, _, filenames) in walk(folder):
+            for file in filenames:
+                if ".mid" in file:
+                    paths.append(path.join(dirpath, file))
+            if not r:
+                self.midiPaths.extend(paths)
+                return
+        self.midiPaths.extend(paths)
+        
+
+
+
+
+
+
+
 
 
 
 
 
 class DecimalEncoder:
-    def __init__(self, folder, convertToC, mode, noteRange, debug = False):
+    def __init__(self, parsedMidis, debug = False):
         """
         Abstract class for all decimal encoders
 
         Parameters
         ----------
-        folder: str
-            Path of the folder that has all midis
-
-        convertToC: bool
-            Whether to convert all midis to C. If a piece does not have key sig then it is not parsed
-        
-        mode: str -> ["major", "minor", "both"]
-            What type of mode to keep. If choice is major then midis with minor mode will not be parsed
-
-        noteRange: tuple
-            The range of notes that will be extracted. Notes outside range will be brought up or brought done octaves
-        
+        parsedMidis: path of folder of streams
+            The parsed midis that will used for training
         debug: bool
             Whether to recieve verbose
         """
         self.debug = debug
-        self.convertToC = convertToC
-        self.mode = mode
-        self.noteRange = noteRange
-        self.midiPaths = findMidis(folder)
-        self._dbg("Found "+ str(len(self.midiPaths)) + " midis.")
 
-    def _applyNoteRange(self):
-        pass
+
 
     def _dbg(self,msg):
         if(self.debug):
             print("[DEBUG "+ str(datetime.datetime.now().strftime("%H:%M:%S")) +"]:"+msg)
-
-    def addFolders(self, folder):
-        self.midiPaths.extend(findMidis(folder))
-
-    def encode(self):
-        self._dbg("Starting to parse midis.")
-        parsedMidis = parseMidis(self.midiPaths, self.convertToC, self.mode, removeDrums = True)
-        self._dbg("Finished parsing midis. Below shows one parsed midi: ")
-        self._dbg(str(parsedMidis[0]))
-        self._dbg(str(getsizeof((parsedMidis[0]))))
-        self._dbg("Starting to encode parsed midis.")
-        return self._encode(parsedMidis)
-
 
     def _encode(self, parsedMidis):
         raise NotImplementedError("Add _encode(midiObjs) function.")
